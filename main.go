@@ -6,347 +6,202 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v4"
 	_ "github.com/lib/pq"
 )
 
-// User структура пользователя
+// User is a struct representing user data
 type User struct {
-	ID       int    `json:"id"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	ID        int       `json:"id"`
+	Username  string    `json:"username"`
+	Password  string    `json:"password"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
-// JWTToken структура JWT токена
-type JWTToken struct {
-	Token string `json:"token"`
-}
-
-// JWTConfig структура конфигурации для JWT токена
-type JWTConfig struct {
-	SecretKey     string
-	ExpiresInSecs int64
-}
-
-// APIResponse структура ответа для API
-type APIResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data"`
-	Error   string      `json:"error,omitempty"`
-}
-
-// PGConfig структура конфигурации для Postgres
-type PGConfig struct {
-	Host     string
-	Port     int
-	Username string
-	Password string
-	Database string
-	SSLMode  string
-}
+const (
+	host     = "localhost"
+	port     = 5432
+	user     = "myuser"
+	password = "mysecretpassword"
+	dbname   = "mydatabase"
+)
 
 var db *sql.DB
-var jwtConfig JWTConfig
+
+// for JWT
+type Claims struct {
+	Username string `json:"username"`
+	jwt.RegisteredClaims
+}
+
+// Create the JWT key used to create the signature
+var jwtKey = []byte("my_secret_key")
 
 func main() {
-	// Инициализируем конфигурацию Postgres
-	pgConfig := PGConfig{
-		Host:     "localhost",
-		Port:     5432,
-		Username: "postgres",
-		Password: "password",
-		Database: "jwt_demo",
-		SSLMode:  "disable",
-	}
-
-	// Инициализируем конфигурацию JWT токена
-	jwtConfig = JWTConfig{
-		SecretKey:     "secret",
-		ExpiresInSecs: 3600,
-	}
-
-	// Устанавливаем соединение с базой данных
-	err := initDB(pgConfig)
+	// Connect to the database
+	var err error
+	db, err = sql.Open("postgres", fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable", host, port, user, password, dbname))
 	if err != nil {
-		log.Fatalf("Ошибка при установлении соединения с базой данных: %s", err.Error())
+		log.Fatal(err)
 	}
 	defer db.Close()
 
-	// Регистрируем хендлеры для роутов
-	http.HandleFunc("/register", handleRegister)
+	// Set up HTTP routes
 	http.HandleFunc("/login", handleLogin)
-	http.HandleFunc("/secure", handleSecure)
-
-	// Запускаем HTTP сервер
-	log.Println("Запуск HTTP сервера...")
-	err = http.ListenAndServe(":8080", nil)
-	if err != nil {
-		log.Fatalf("Ошибка при запуске HTTP сервера: %s", err.Error())
-	}
+	http.HandleFunc("/register", handleRegister)
+	// http.HandleFunc("/homepage", withAuth(handleHomepage)) // эту страницу показываем только авторизованным пользоватлелям!
+	http.HandleFunc("/getUserData", getUserData)
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// initDB устанавливает соединение с базой данных
-func initDB(cfg PGConfig) error {
-	var err error
-	// dbinfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-	// 	cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode)
-	// db, err = sql.Open("postgres", dbinfo)
-	db, err := sql.Open("postgres", "host=localhost port=5432 user=postgres dbname=postgres password=password sslmode=disable")
-	if err != nil {
-		return err
-	}
-	// Проверяем соединение с базой данных
-	err = db.Ping()
-	if err != nil {
-		return err
-	}
-
-	// Создаем таблицу пользователей, если ее нет
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL);")
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// type Credentials struct {
-// 	Username string `json:"username"`
-// 	Password string `json:"password"`
-// }
-
-// handleRegister обрабатывает запрос на регистрацию нового пользователя
-func handleRegister(w http.ResponseWriter, r *http.Request) {
-	// Получаем данные пользователя из тела запроса
-	username := r.FormValue("username")
-	password := r.FormValue("password")
-
-	// Проверяем, что данные получены
-	if username == "" || password == "" {
-		fmt.Println(username, password)
-		writeError(w, "Не все данные переданы")
-		return
-	}
-
-	// Проверяем, что пользователь с таким именем не существует
-	user, err := getUserByUsername(username)
-	if err != nil {
-		writeError(w, "Ошибка при выполнении запроса к базе данных")
-		return
-	}
-	if user != nil {
-		writeError(w, "Пользователь с таким именем уже существует")
-		return
-	}
-
-	// Хешируем пароль
-	hashedPassword, err := hashPassword(password)
-	if err != nil {
-		writeError(w, "Ошибка при хешировании пароля")
-		return
-	}
-
-	// Добавляем нового пользователя в базу данных
-	_, err = db.Exec("INSERT INTO users (username, password) VALUES ($1, $2)", username, hashedPassword)
-	if err != nil {
-		writeError(w, "Ошибка при выполнении запроса к базе данных")
-		return
-	}
-
-	writeSuccess(w, "Регистрация прошла успешно")
-}
-
-// handleLogin обрабатывает запрос на вход пользователя
 func handleLogin(w http.ResponseWriter, r *http.Request) {
-	// Получаем данные пользователя из тела запроса
-	username := r.FormValue("username")
-	password := r.FormValue("password")
-
-	// Проверяем, что данные получены
-	if username == "" || password == "" {
-		writeError(w, "Не все данные переданы")
-		return
-	}
-
-	// Получаем пользователя из базы данных
-	user, err := getUserByUsername(username)
+	// Parse the request body
+	var u User
+	err := json.NewDecoder(r.Body).Decode(&u)
 	if err != nil {
-		writeError(w, "Ошибка при выполнении запроса к базе данных")
-		return
-	}
-	if user == nil {
-		writeError(w, "Неверные имя пользователя или пароль")
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Проверяем пароль
-	err = checkPassword(user.Password, password)
+	// Lookup the user in the database by username and password
+	var storedUser User
+	err = db.QueryRow("SELECT id, username, password, created_at FROM users WHERE username = $1 AND password = $2", u.Username, u.Password).Scan(&storedUser.ID, &storedUser.Username, &storedUser.Password, &storedUser.CreatedAt)
+	if err == sql.ErrNoRows {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Generate a token and send it in the response
+
+	// TOKEN BEGIN ----------------------------
+	// Declare the expiration time of the token
+	// here, we have kept it as 5 minutes
+	expirationTime := time.Now().Add(5 * time.Minute)
+	// Create the JWT claims, which includes the username and expiry time
+	claims := &Claims{
+		Username: storedUser.Username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			// In JWT, the expiry time is expressed as unix milliseconds
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+		},
+	}
+
+	// Declare the token with the algorithm used for signing, and the claims
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	// Create the JWT string
+	tokenString, err := token.SignedString(jwtKey)
 	if err != nil {
-		writeError(w, "Неверные имя пользователя или пароль")
+		// If there is an error in creating the JWT return an internal server error
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	// Генерируем JWT токен
-	token, err := generateJWTToken(user.ID)
-	if err != nil {
-		writeError(w, "Ошибка при генерации токена")
-		return
-	}
-
-	// Отдаем токен пользователю
-	writeData(w, JWTToken{Token: token})
+	// Finally, we set the client cookie for "token" as the JWT we just generated
+	// we also set an expiry time which is the same as the token itself
+	http.SetCookie(w, &http.Cookie{
+		Name:    "token",
+		Value:   tokenString,
+		Expires: expirationTime,
+	})
+	// TOKEN END ----------------------------
 }
 
-// handleSecure обрабатывает защищенный запрос
-func handleSecure(w http.ResponseWriter, r *http.Request) {
-	// Получаем JWT токен из заголовка Authorization
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		writeError(w, "Токен не указан")
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	// Parse the request body
+	var u User
+	err := json.NewDecoder(r.Body).Decode(&u)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	authHeaderParts := strings.Split(authHeader, " ")
-	if len(authHeaderParts) != 2 || authHeaderParts[0] != "Bearer" {
-		writeError(w, "Неверный формат токена")
-		return
-	}
-	tokenString := authHeaderParts[1]
 
-	// Проверяем JWT токен
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("Неверный метод подписи токена: %v", token.Header["alg"])
+	// Insert the user into the database
+	_, err = db.Exec("INSERT INTO users (username, password, created_at) VALUES ($1, $2, $3)", u.Username, u.Password, time.Now())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Generate a token and send it in the response
+
+	// TOKEN BEGIN ----------------------------
+	// Declare the expiration time of the token
+	// here, we have kept it as 5 minutes
+	expirationTime := time.Now().Add(5 * time.Minute)
+	// Create the JWT claims, which includes the username and expiry time
+	claims := &Claims{
+		Username: u.Username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			// In JWT, the expiry time is expressed as unix milliseconds
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+		},
+	}
+
+	// Declare the token with the algorithm used for signing, and the claims
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	// Create the JWT string
+	tokenString, err := token.SignedString(jwtKey)
+	if err != nil {
+		// If there is an error in creating the JWT return an internal server error
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// Finally, we set the client cookie for "token" as the JWT we just generated
+	// we also set an expiry time which is the same as the token itself
+	http.SetCookie(w, &http.Cookie{
+		Name:    "token",
+		Value:   tokenString,
+		Expires: expirationTime,
+	})
+	// TOKEN END ----------------------------
+}
+
+// ф-ия возвращает информацию о пользователе, если у него есть токен
+func getUserData(w http.ResponseWriter, r *http.Request) {
+	// We can obtain the session token from the requests cookies, which come with every request
+	c, err := r.Cookie("token")
+	if err != nil {
+		if err == http.ErrNoCookie {
+			// If the cookie is not set, return an unauthorized status
+			w.WriteHeader(http.StatusUnauthorized)
+			return
 		}
-		return []byte(jwtConfig.SecretKey), nil
+		// For any other type of error, return a bad request status
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	// Get the JWT string from the cookie
+	tknStr := c.Value
+
+	// Initialize a new instance of `Claims`
+	claims := &Claims{}
+
+	// Parse the JWT string and store the result in `claims`.
+	// Note that we are passing the key in this method as well. This method will return an error
+	// if the token is invalid (if it has expired according to the expiry time we set on sign in),
+	// or if the signature does not match
+	tkn, err := jwt.ParseWithClaims(tknStr, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
 	})
 	if err != nil {
-		writeError(w, "Ошибка при проверке токена")
-		return
-	}
-	if !token.Valid {
-		writeError(w, "Невалидный токен")
-		return
-	}
-
-	userID, ok := token.Claims.(jwt.MapClaims)["user_id"].(float64)
-	if !ok {
-		writeError(w, "Ошибка при чтении идентификатора пользователя")
-		return
-	}
-
-	// Получаем пользователя из базы данных
-	user, err := getUserByID(int(userID))
-	if err != nil {
-		writeError(w, "Ошибка при выполнении запроса к базе данных")
-		return
-	}
-	if user == nil {
-		writeError(w, "Ошибка при чтении пользователя из базы данных")
-		return
-	}
-
-	writeSuccess(w, fmt.Sprintf("Защищенный запрос выполнен для пользователя с ID=%d", user.ID))
-}
-
-// getUserByUsername получает пользователя по его имени в базе данных
-func getUserByUsername(username string) (*User, error) {
-	var user User
-	row := db.QueryRow("SELECT id, username, password FROM users WHERE username=$1", username)
-	err := row.Scan(&user.ID, &user.Username, &user.Password)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
+		if err == jwt.ErrSignatureInvalid {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
 		}
-		return nil, err
-	}
-	return &user, nil
-}
-
-// getUserByID получает пользователя по его ID в базе данных
-func getUserByID(id int) (*User, error) {
-	var user User
-	row := db.QueryRow("SELECT id, username, password FROM users WHERE id=$1", id)
-	err := row.Scan(&user.ID, &user.Username, &user.Password)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &user, nil
-}
-
-// hashPassword хеширует пароль
-func hashPassword(password string) (string, error) {
-	// В реальном приложении стоит использовать более сложный алгоритм хеширования, например bcrypt
-	return password, nil
-}
-
-// checkPassword проверяет пароль на соотвествие хешу пароля в базе данных
-func checkPassword(hashedPassword, password string) error {
-	// В реальном приложении стоит использовать более сложный алгоритм хеширования, например bcrypt
-	if hashedPassword == password {
-		return nil
-	}
-	return fmt.Errorf("неверный пароль")
-}
-
-// generateJWTToken генерирует JWT токен для пользователя с указанным ID
-func generateJWTToken(userID int) (string, error) {
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": userID,
-		"exp":     time.Now().Add(time.Duration(jwtConfig.ExpiresInSecs) * time.Second).Unix(),
-	})
-	return token.SignedString([]byte(jwtConfig.SecretKey))
-}
-
-// writeSuccess записывает успешный ответ API в HTTP ResponseWriter в формате JSON
-func writeSuccess(w http.ResponseWriter, data interface{}) {
-	response := APIResponse{
-		Success: true,
-		Data:    data,
-	}
-	jsonBytes, err := json.Marshal(response)
-	if err != nil {
-		http.Error(w, "Ошибка при сериализации успешного ответа API в JSON", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(jsonBytes)
-}
-
-// writeData записывает данные в HTTP ResponseWriter в формате JSON
-func writeData(w http.ResponseWriter, data interface{}) {
-	response := APIResponse{
-		Success: true,
-		Data:    data,
-	}
-	jsonBytes, err := json.Marshal(response)
-	if err != nil {
-		http.Error(w, "Ошибка при сериализации данных в JSON", http.StatusInternalServerError)
+	if !tkn.Valid {
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write(jsonBytes)
-}
-
-// writeError записывает ошибку в HTTP ResponseWriter в формате JSON
-func writeError(w http.ResponseWriter, errorMessage string) {
-	response := APIResponse{
-		Success: false,
-		Error:   errorMessage,
-	}
-	jsonBytes, err := json.Marshal(response)
-	if err != nil {
-		http.Error(w, "Ошибка при сериализации ошибки в JSON", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	w.Write(jsonBytes)
+	// Finally, return the welcome message to the user, along with their
+	// username given in the token
+	w.Write([]byte(fmt.Sprintf("Welcome %s!", claims.Username)))
 }
